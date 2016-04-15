@@ -1,78 +1,71 @@
 package main
 
-/*
-* Link Shortener, with a Redis backend.
-*
-* Released under and MIT License, please see the LICENSE.md file.
-*
-* John Nye
-*
- */
 import (
-	"github.com/johnnye/short/utils"
-	"github.com/garyburd/redigo/redis"
 	"encoding/json"
-	"io/ioutil"
-	"net/http"
-	"strings"
 	"flag"
 	"fmt"
-	"log"
+	"gopkg.in/redis.v3"
+	"io/ioutil"
+	"net/http"
 )
 
-var host = flag.String("h", "localhost", "Bind address to listen on")
-var base = flag.String("b", "http://localhost/", "Base URL for the shortener")
-var port = flag.String("p", "8080", "Port you want to listen on, defaults to 8080")
-var maxConnections = flag.Int("c", 512, "The maximum number of active connections") //Currently Not Used
-var redisConn = flag.String("r", "localhost:6379", "Redis Address, defaults to localhost:6379")
+var (
+	// Flags
+	host      = flag.String("h", "localhost", "Bind address to listen on")
+	base      = flag.String("b", "http://localhost/", "Base URL for the shortener")
+	port      = flag.String("p", "8080", "Port you want to listen on, defaults to 8080")
+	redisConn = flag.String("r", "localhost:6379", "Redis Address, defaults to localhost:6379")
+	authCode  = flag.String("a", "", "Authorization code")
 
-type Data struct {
-	Original  string
-	Short     string
-	FullShort string
-	HitCount  int
+	// Redis connection
+	redisClient *redis.Client
+)
+
+type ShortendURL struct {
+	LongURL string `json:"long_url"`
+	ShortID string `json:"short_id"`
+
+	// Optionally the auth code
+	AuthCode string `json:"auth_code",omitempty`
 }
 
-var redisPool = &redis.Pool{
-	MaxIdle:   3,
-	MaxActive: 50, // max number of connections
-	Dial: func() (redis.Conn, error) {
-		c, err := redis.Dial("tcp", *redisConn)
-		if err != nil {
-			panic(err.Error())
-		}
-		return c, err
-	},
+// link:id:views - int
+// link:id:url - string
+
+func NewShortendURL(obj ShortendURL) error {
+	return redisClient.Set(fmt.Sprintf("link:%v:url", obj.ShortID), obj.LongURL, 0).Err()
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-
-	log.Println(r.UserAgent())
-
-	type NewURL struct {
-		URL string
+func GetShortendURL(id string) (*ShortendURL, error) {
+	err := redisClient.Incr(fmt.Sprintf("link:%v:views", id)).Err()
+	if err != nil {
+		return nil, err
 	}
-	var url NewURL
-	var domain Data
 
-	conn := redisPool.Get()
-	defer conn.Close()
+	val, err := redisClient.Get(fmt.Sprintf("link:%v:url", id)).Result()
+	if err != nil {
+		return nil, err
+	}
 
-	if r.Method == "GET" {
-		domain, err := getLongURL(r.URL.Path[1:], conn)
-		if err !=nil {
-			log.Println(err)
-		}
-		
-		if len(domain.Original) > 0 {
-			http.Redirect(w, r, domain.Original, http.StatusFound)
-			return
-		}
-		http.ServeFile(w, r, "./index.html")		
-		log.Println("Served Homepage")
+	return &ShortendURL{
+		LongURL: val,
+		ShortID: id,
+	}, nil
+}
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	domain, err := GetShortendURL(r.URL.Path[1:])
+	if err != nil {
+		http.Error(w, "Failed to get long URL from short key", http.StatusBadRequest)
 		return
 	}
 
+	http.Redirect(w, r, domain.LongURL, http.StatusFound)
+	return
+}
+
+func handleCreate(w http.ResponseWriter, r *http.Request) {
+	var obj ShortendURL
 	create, err := ioutil.ReadAll(r.Body)
 
 	if err != nil {
@@ -80,114 +73,43 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = json.Unmarshal(create, &url)
+	err = json.Unmarshal(create, &obj)
 	if err != nil {
-		log.Print(err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	search := strings.Join([]string{"*||", url.URL}, "")
-
-	keys, err := redis.Strings(conn.Do("KEYS", search))
-
-	if len(keys) < 1 {
-		domain, err = createShortURL(url.URL, conn)
-	} else {
-		domain, err = getInfoForKey(keys[0], conn)
+	if obj.AuthCode != *authCode {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 	}
 
+	err = NewShortendURL(obj)
 	if err != nil {
-		log.Print(err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	output, err := json.Marshal(domain)
-
+	obj.AuthCode = ""
+	output, err := json.Marshal(obj)
 	if err != nil {
-		log.Print(err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	fmt.Fprintf(w, "%s", output)
-}
 
-func getInfoForKey(key string, conn redis.Conn) (Data, error) {
-	var d Data
-	parts := strings.Split(key, "||")
-	d.Short = parts[0]
-	d.Original = parts[1]
-	d.FullShort = strings.Join([]string{*base, parts[0]}, "")
-	newCount, err := redis.Int(conn.Do("HGET", key, "count"))
-	if err != nil {
-		log.Print(err)
-	}
-	d.HitCount = newCount
-	return d, err
-}
-
-func createShortURL(url string, conn redis.Conn) (Data, error) {
-	var d Data
-	count, err := redis.Int(conn.Do("INCR", "global:size"))
-	if err != nil {
-		log.Print(err)
-		return d, err
-	}
-	log.Print("Total: ",count)
-	encodedVar := base62.EncodeInt(int64(count))
-	key := strings.Join([]string{encodedVar, url}, "||")
-	conn.Send("MULTI")
-	conn.Send("HSET", key, "count", 0)
-	_, err2 := conn.Do("EXEC")
-
-	if err2 != nil {
-		log.Print(err2)
-		return d, err2
-	}
-
-	d.Original = url
-	d.HitCount = 0
-	d.Short = encodedVar
-	d.FullShort = strings.Join([]string{*base, encodedVar}, "")
-
-	return d, err
-}
-
-func getLongURL(short string, conn redis.Conn) (Data, error) {
-	var d Data
-
-	search := strings.Join([]string{short, "||*"}, "")
-	fmt.Println(search)
-	n, err := redis.Strings(conn.Do("KEYS", search))
-
-	if err != nil {
-		log.Print(err)
-		return d, err
-	}
-
-	if len(n) < 1 {
-		log.Print("Nothing Found")
-	} else {
-		parts := strings.Split(n[0], "||")
-
-		d.Short = parts[0]
-		d.Original = parts[1]
-		d.FullShort = strings.Join([]string{*base, parts[0]}, "")
-		newCount, err := redis.Int(conn.Do("HINCRBY", n[0], "count", 1))
-		if err != nil {
-			log.Println(err)
-		}
-		d.HitCount = newCount
-	}
-	log.Println("Served: ",d.Original)
-	return d, nil
+	w.Write(output)
 }
 
 func main() {
 	flag.Parse()
 
-	http.HandleFunc("/", handler)
+	// Connect to redis
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     *redisConn,
+		PoolSize: 64,
+	})
+
+	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/create", handleCreate)
 	err := http.ListenAndServe(*host+":"+*port, nil)
 	if err != nil {
 		fmt.Println(err)
