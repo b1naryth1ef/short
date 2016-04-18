@@ -66,7 +66,7 @@ func GetShortendURL(id string) (*ShortendURL, error) {
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	domain, err := GetShortendURL(r.URL.Path[1:])
+	domain, err := GetShortendURL(strings.ToLower(r.URL.Path[1:]))
 	if err != nil {
 		http.Error(w, "Failed to get long URL from short key", http.StatusBadRequest)
 		return
@@ -141,6 +141,8 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if obj.AuthCode != *authCode {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 	}
+
+	obj.ShortID = strings.ToLower(obj.ShortID)
 
 	err = redisClient.Set(fmt.Sprintf("link:%v:url", obj.ShortID), obj.LongURL, 0).Err()
 	if err != nil {
