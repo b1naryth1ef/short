@@ -7,6 +7,8 @@ import (
 	"gopkg.in/redis.v3"
 	"io/ioutil"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 var (
@@ -25,31 +27,39 @@ type ShortendURL struct {
 	LongURL string `json:"long_url"`
 	ShortID string `json:"short_id"`
 
+	// On return, the full short url
+	ShortURL string `json:"short_url",omitempty`
+
+	// Optionally the view count
+	Views int `json:"views",omitempty`
+
 	// Optionally the auth code
 	AuthCode string `json:"auth_code",omitempty`
 }
 
-// link:id:views - int
-// link:id:url - string
+func (s *ShortendURL) GetViews() (int, error) {
+	val, err := redisClient.Get(fmt.Sprintf("link:%v:views", s.ShortID)).Result()
+	if err != nil {
+		return 0, err
+	}
 
-func NewShortendURL(obj ShortendURL) error {
-	return redisClient.Set(fmt.Sprintf("link:%v:url", obj.ShortID), obj.LongURL, 0).Err()
+	return strconv.Atoi(val)
+}
+
+func HitShortendURL(id string) error {
+	return redisClient.Incr(fmt.Sprintf("link:%v:views", id)).Err()
 }
 
 func GetShortendURL(id string) (*ShortendURL, error) {
-	err := redisClient.Incr(fmt.Sprintf("link:%v:views", id)).Err()
-	if err != nil {
-		return nil, err
-	}
-
 	val, err := redisClient.Get(fmt.Sprintf("link:%v:url", id)).Result()
 	if err != nil {
 		return nil, err
 	}
 
 	return &ShortendURL{
-		LongURL: val,
-		ShortID: id,
+		LongURL:  val,
+		ShortID:  id,
+		ShortURL: *base + id,
 	}, nil
 }
 
@@ -60,8 +70,55 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err = HitShortendURL(r.URL.Path[1:])
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
 	http.Redirect(w, r, domain.LongURL, http.StatusFound)
 	return
+}
+
+func handleList(w http.ResponseWriter, r *http.Request) {
+	var (
+		keyId string
+		links []*ShortendURL
+	)
+
+	val, err := redisClient.Keys("link:*:url").Result()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	for _, key := range val {
+		keyId = strings.Split(key, ":")[1]
+
+		// Grab the shortend url
+		url, err := GetShortendURL(keyId)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		// Grab the view count
+		url.Views, err = url.GetViews()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		links = append(links, url)
+	}
+
+	output, err := json.Marshal(links)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	w.Write(output)
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +140,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 	}
 
-	err = NewShortendURL(obj)
+	err = redisClient.Set(fmt.Sprintf("link:%v:url", obj.ShortID), obj.LongURL, 0).Err()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -109,7 +166,8 @@ func main() {
 	})
 
 	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/create", handleCreate)
+	http.HandleFunc("/links", handleList)
+	http.HandleFunc("/links/create", handleCreate)
 	err := http.ListenAndServe(*host+":"+*port, nil)
 	if err != nil {
 		fmt.Println(err)
