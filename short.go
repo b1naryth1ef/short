@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/gorilla/handlers"
 	"gopkg.in/redis.v3"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -165,10 +167,27 @@ func main() {
 		PoolSize: 64,
 	})
 
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/links", handleList)
-	http.HandleFunc("/links/create", handleCreate)
-	err := http.ListenAndServe(*host+":"+*port, nil)
+	server := http.NewServeMux()
+	server.HandleFunc("/", handleIndex)
+	server.HandleFunc("/links", handleList)
+	server.HandleFunc("/links/create", handleCreate)
+
+	// If the requests log doesnt exist, make it
+	if _, err := os.Stat("requests.log"); os.IsNotExist(err) {
+		ioutil.WriteFile("requests.log", []byte{}, 0600)
+	}
+
+	// Open the log file in append mode
+	logFile, err := os.OpenFile("requests.log", os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer logFile.Close()
+
+	// Actually start the server
+	loggedRouter := handlers.LoggingHandler(logFile, server)
+
+	err = http.ListenAndServe(*host+":"+*port, loggedRouter)
 	if err != nil {
 		fmt.Println(err)
 	}
